@@ -1,0 +1,266 @@
+name: Build installers
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    name: Ubuntu 24.04 DEB
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git \
+            libavcodec-dev libavutil-dev libswresample-dev libswscale-dev \
+            libsodium-dev libx11-dev libxtst-dev libxrandr-dev libpulse-dev \
+            libasound2-dev libdbus-1-dev libegl1-mesa-dev libgbm-dev \
+            libgl1-mesa-dev libxext-dev libxfixes-dev libxi-dev \
+            libxcursor-dev libxinerama-dev libxss-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libdrm-dev dpkg-dev fakeroot
+
+      - name: Configure
+        run: cmake --preset release -DGRD_ENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build --preset release --parallel
+
+      - name: Test
+        run: ctest --preset release --output-on-failure
+
+      - name: Build and inspect DEB
+        run: |
+          cpack --config build/release/CPackConfig.cmake -G DEB -B build/release
+          deb_file="$(find build/release -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$deb_file"
+          dpkg-deb --info "$deb_file"
+          dpkg-deb --contents "$deb_file"
+
+      - name: Upload Ubuntu installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: GRD-Ubuntu-24.04-x64
+          path: build/release/*.deb
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install MSYS2 toolchain and libraries
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-libsodium
+
+      - name: Configure
+        shell: msys2 {0}
+        run: cmake --preset release -DGRD_ENABLE_CUDA=OFF
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build --preset release --parallel
+
+      - name: Test
+        shell: msys2 {0}
+        run: ctest --preset release --output-on-failure
+
+      - name: Collect executable and runtime DLLs
+        shell: msys2 {0}
+        run: bash scripts/package-windows.sh
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --version=6.7.1 -y --no-progress
+
+      - name: Compile Windows installer
+        shell: pwsh
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $compiler)) {
+            throw "Inno Setup compiler not found: $compiler"
+          }
+          & $compiler "packaging\windows\grd.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Smoke-test silent installation and uninstallation
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "dist\installer\*.exe" | Select-Object -First 1
+          if (-not $installer) {
+            throw "Windows installer was not produced"
+          }
+          $installDir = Join-Path $env:RUNNER_TEMP "GRD-install-test"
+          $process = Start-Process $installer.FullName `
+            -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir" `
+            -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path "$installDir\grd.exe")) {
+            throw "Silent installation failed"
+          }
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          $process = Start-Process $uninstaller `
+            -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" `
+            -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Silent uninstallation failed"
+          }
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: GRD-Windows-x64
+          path: dist/installer/*.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS arm64 app
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          brew install pkg-config ffmpeg sdl3 libsodium ninja
+
+      - name: Configure
+        run: cmake --preset release -DGRD_ENABLE_CUDA=OFF
+
+      - name: Build
+        run: cmake --build --preset release --parallel
+
+      - name: Test
+        run: ctest --preset release --output-on-failure
+
+      - name: Install and ad-hoc sign the bundle
+        run: |
+          mkdir -p dist
+          cmake --install build/release --prefix "$PWD/dist"
+          codesign --verify --deep dist/grd.app
+
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v7
+        with:
+          name: GRD-macOS-arm64
+          path: dist/grd.app
+          if-no-files-found: error
+
+  # Compile check for the optional CUDA backend (cuda_pipeline.cu and the
+  # Windows-only CUDA<->D3D11 interop). The installer jobs intentionally
+  # disable CUDA, so without this job the .cu sources are never compiled.
+  windows-cuda:
+    name: Windows x64 CUDA compile check
+    # CUDA 12.6's cudafe++ crashes while probing the VS 2026 toolset currently
+    # installed on windows-latest, even with the unsupported-compiler override.
+    # Pin VS 2022: this is also the toolchain used by the Windows host recipe.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install MSYS2 toolchain and libraries
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-libsodium
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.23
+        with:
+          # CUDA 12.8 is the first toolkit with compiler support for the
+          # Blackwell SM 120 path used by the RTX 5090 host.
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Initialize MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure (CUDA required)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          dep_root="$RUNNER_TEMP/grd-cuda-deps"
+          rm -rf "$dep_root"
+          mkdir -p "$dep_root"
+          for directory in SDL3 libavcodec libavutil libswresample libswscale sodium; do
+            cp -R "/ucrt64/include/$directory" "$dep_root/"
+          done
+          cp /ucrt64/include/sodium.h "$dep_root/"
+
+          export GRD_DEP_INCLUDE="$(cygpath -w "$dep_root")"
+          cuda_root="$(cygpath -u "$CUDA_PATH")"
+          msvc_root="$(cygpath -u "$VCToolsInstallDir")"
+          msvc_bin="$msvc_root/bin/Hostx64/x64"
+          vs_root="$(cygpath -u "$VSINSTALLDIR")"
+          clang_cl="$vs_root/VC/Tools/Llvm/x64/bin/clang-cl.exe"
+          sdk_root="$(cygpath -u "$WindowsSdkDir")"
+          sdk_version="${WindowsSDKVersion%\\}"
+          test -x "$clang_cl"
+          test -x "$cuda_root/bin/nvcc.exe"
+          test -x "$msvc_bin/cl.exe"
+          test -x "$msvc_bin/link.exe"
+          test -x "$msvc_bin/lib.exe"
+          test -x "$sdk_root/bin/$sdk_version/x64/rc.exe"
+
+          cmake -S . -B build/cuda -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGRD_BUILD_TESTS=ON \
+            -DGRD_REQUIRE_CUDA=ON \
+            -DCMAKE_C_COMPILER="$clang_cl" \
+            -DCMAKE_CUDA_COMPILER="$cuda_root/bin/nvcc.exe" \
+            -DCMAKE_CUDA_HOST_COMPILER="$msvc_bin/cl.exe" \
+            -DCMAKE_RC_COMPILER="$sdk_root/bin/$sdk_version/x64/rc.exe" \
+            -DCMAKE_LINKER="$msvc_bin/link.exe" \
+            -DCMAKE_AR="$msvc_bin/lib.exe" \
+            -DCMAKE_CUDA_ARCHITECTURES=120 \
+            -DCUDAToolkit_ROOT="$cuda_root" \
+            "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler -D_WINDOWS"
+
+          grep -F "cuda_pipeline.cu" build/cuda/build.ninja
+          grep -F "cuda_d3d11.cu" build/cuda/build.ninja
+
+      - name: Build CUDA targets
+        shell: msys2 {0}
+        run: cmake --build build/cuda --target grd grd_tests --parallel
+
+      - name: Test CUDA build
+        shell: msys2 {0}
+        run: |
+          # MSVC-linked executables still load the SDL/FFmpeg/libsodium import
+          # DLLs supplied by UCRT64. Keep both those and cudart visible to the
+          # native Windows loader when CTest starts grd_tests.exe.
+          export PATH="/ucrt64/bin:$(cygpath -u "$CUDA_PATH")/bin:$PATH"
+          ctest --test-dir build/cuda --output-on-failure

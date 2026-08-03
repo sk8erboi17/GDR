@@ -1,0 +1,12 @@
+build/
+out/
+dist/
+/logs/
+/.idea
+/.vscode
+.DS_Store
+*.log
+*.pem
+*.key
+scripts/grd-remote-access.local.psd1
+compile_commands.json

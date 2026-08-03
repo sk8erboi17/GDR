@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GRD
+Comment=Remote desktop cifrato per la LAN
+Exec=grd
+Icon=grd
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;lan;
